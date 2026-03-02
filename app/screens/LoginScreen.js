@@ -10,6 +10,10 @@ import {
   View,
 } from 'react-native';
 
+import { EVA_CORE_URL } from '../config';
+
+const APP_VERSION = '1.0.2';
+
 export default function LoginScreen({ onSubmit, loading, error }) {
   const [password, setPassword] = useState('');
 
@@ -26,8 +30,12 @@ export default function LoginScreen({ onSubmit, loading, error }) {
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
       <View style={s.heroCard}>
-        <Text style={s.brand}>Eva Mobile</Text>
+        <View style={s.brandRow}>
+          <Text style={s.brand}>Eva Mobile</Text>
+          <Text style={s.version}>v{APP_VERSION}</Text>
+        </View>
         <Text style={s.subtitle}>Sign in once. Chat and location stay active.</Text>
+        <Text style={s.endpoint}>{EVA_CORE_URL}</Text>
 
         <View style={s.formCard}>
           <Text style={s.label}>Password</Text>
@@ -72,11 +80,28 @@ const s = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#22324f',
   },
+  brandRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 10,
+  },
   brand: {
     color: '#f8fafc',
     fontSize: 34,
     fontWeight: '800',
     letterSpacing: 0.4,
+  },
+  version: {
+    color: '#334155',
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 5,
+  },
+  endpoint: {
+    marginTop: 4,
+    color: '#1e3a5f',
+    fontSize: 11,
+    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier',
   },
   subtitle: {
     marginTop: 8,
