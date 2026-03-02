@@ -1,65 +1,179 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
+  Platform,
+  Pressable,
+  StatusBar as NativeStatusBar,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
-import { StatusBar } from 'expo-status-bar';
+import { StatusBar as ExpoStatusBar } from 'expo-status-bar';
+import { WebView } from 'react-native-webview';
 
-import LoginScreen from './screens/LoginScreen';
-import ChannelListScreen from './screens/ChannelListScreen';
-import ChatScreen from './screens/ChatScreen';
-import { getChannels, getCurrentUser, loginWithPassword } from './service/api';
+import { APP_VERSION, EVA_WEB_URL } from './config';
 import { startLocationPusher, stopLocationPusher } from './service/location-pusher';
-import { connectSocket, disconnectSocket, getSocket } from './service/socket';
+import { connectSocket, disconnectSocket } from './service/socket';
 import * as Sensors from './service/sensors';
 import { clearAuthSession, loadAuthSession, saveAuthSession } from './store/auth';
 
-export default function App() {
-  const [booting, setBooting] = useState(true);
-  const [auth, setAuth] = useState(null);
-  const [authError, setAuthError] = useState('');
-  const [loginLoading, setLoginLoading] = useState(false);
+const AUTH_STORAGE_KEY = 'eva-core-auth';
+const ANDROID_TOP_INSET = Platform.OS === 'android'
+  ? Math.max(50, Number(NativeStatusBar.currentHeight || 0) + 10)
+  : 0;
 
-  const [channels, setChannels] = useState([]);
-  const [channelsLoading, setChannelsLoading] = useState(false);
-  const [activeChannel, setActiveChannel] = useState(null);
-
-  const [socketConnected, setSocketConnected] = useState(false);
-  const [sensorSnapshot, setSensorSnapshot] = useState(Sensors.getSnapshot());
-
-  const authenticatedUser = auth?.user || null;
-
-  const refreshChannels = useCallback(async (token) => {
-    const effectiveToken = String(token || auth?.token || '').trim();
-    if (!effectiveToken) return;
-
-    setChannelsLoading(true);
-    try {
-      const response = await getChannels(effectiveToken);
-      setChannels(Array.isArray(response?.channels) ? response.channels : []);
-    } catch (err) {
-      setChannels([]);
-      Alert.alert('Channels unavailable', err.message || 'Could not load channels');
-    } finally {
-      setChannelsLoading(false);
+const AUTH_BRIDGE_SCRIPT = `
+  (function () {
+    if (window.__evaMobileBridgeInstalled) {
+      return;
     }
-  }, [auth?.token]);
+    window.__evaMobileBridgeInstalled = true;
 
-  const forceLogout = useCallback(async (message = '') => {
-    stopLocationPusher();
-    disconnectSocket();
-    await Sensors.stop().catch(() => {});
+    var authStorageKey = ${JSON.stringify(AUTH_STORAGE_KEY)};
+
+    function post(payload) {
+      try {
+        if (window.ReactNativeWebView && typeof window.ReactNativeWebView.postMessage === 'function') {
+          window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+        }
+      } catch (_) {}
+    }
+
+    function postRoute() {
+      post({
+        type: 'eva-route',
+        href: String(window.location && window.location.href || ''),
+        path: String(window.location && window.location.pathname || ''),
+      });
+    }
+
+    function postAuthState() {
+      try {
+        var raw = localStorage.getItem(authStorageKey);
+        var parsed = raw ? JSON.parse(raw) : null;
+        var state = parsed && parsed.state ? parsed.state : {};
+        var token = typeof state.token === 'string' ? state.token : '';
+        var isAuthenticated = Boolean(state.isAuthenticated && token);
+
+        post({
+          type: 'eva-auth',
+          token: token,
+          user: state.user || null,
+          isAuthenticated: isAuthenticated,
+        });
+      } catch (error) {
+        post({
+          type: 'eva-auth-error',
+          message: String((error && error.message) || error || 'unknown'),
+        });
+      }
+    }
+
+    var originalSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = function (key, value) {
+      originalSetItem(key, value);
+      if (key === authStorageKey) {
+        postAuthState();
+      }
+    };
+
+    var originalRemoveItem = localStorage.removeItem.bind(localStorage);
+    localStorage.removeItem = function (key) {
+      originalRemoveItem(key);
+      if (key === authStorageKey) {
+        postAuthState();
+      }
+    };
+
+    var originalPushState = history.pushState;
+    history.pushState = function () {
+      originalPushState.apply(history, arguments);
+      postRoute();
+    };
+
+    var originalReplaceState = history.replaceState;
+    history.replaceState = function () {
+      originalReplaceState.apply(history, arguments);
+      postRoute();
+    };
+
+    window.addEventListener('popstate', postRoute);
+    window.addEventListener('hashchange', postRoute);
+    window.addEventListener('storage', function (event) {
+      if (!event || event.key === authStorageKey) {
+        postAuthState();
+      }
+    });
+
+    postAuthState();
+    postRoute();
+    setInterval(postAuthState, 4000);
+  })();
+  true;
+`;
+
+function parseMessage(raw) {
+  try {
+    return JSON.parse(String(raw || ''));
+  } catch (_) {
+    return null;
+  }
+}
+
+function urlPath(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  try {
+    return String(new URL(raw).pathname || '');
+  } catch (_) {
+    return raw;
+  }
+}
+
+function isLoginPath(path) {
+  const normalized = String(path || '').toLowerCase();
+  if (!normalized) return false;
+  if (normalized.includes('/chat')) return false;
+  return (
+    normalized.endsWith('/eva-orchestrator')
+    || normalized.endsWith('/eva-orchestrator/')
+    || normalized.endsWith('/login')
+  );
+}
+
+export default function App() {
+  const authSessionRef = useRef(null);
+
+  const [booting, setBooting] = useState(true);
+  const [authSession, setAuthSession] = useState(null);
+
+  const [webViewKey, setWebViewKey] = useState(1);
+  const [webError, setWebError] = useState('');
+  const [bridgeError, setBridgeError] = useState('');
+  const [currentPath, setCurrentPath] = useState('');
+
+  const updateSession = useCallback(async (nextSession) => {
+    const nextToken = String(nextSession?.token || '').trim();
+    const currentToken = String(authSessionRef.current?.token || '').trim();
+
+    if (nextToken === currentToken) {
+      return;
+    }
+
+    if (nextToken) {
+      const normalizedSession = {
+        token: nextToken,
+        user: nextSession?.user || null,
+      };
+      authSessionRef.current = normalizedSession;
+      setAuthSession(normalizedSession);
+      await saveAuthSession(nextToken, normalizedSession.user);
+      return;
+    }
+
+    authSessionRef.current = null;
+    setAuthSession(null);
     await clearAuthSession();
-
-    setAuth(null);
-    setChannels([]);
-    setActiveChannel(null);
-    setSocketConnected(false);
-    setSensorSnapshot(Sensors.getSnapshot());
-    setAuthError(message);
   }, []);
 
   useEffect(() => {
@@ -67,18 +181,13 @@ export default function App() {
 
     async function bootstrap() {
       try {
-        const session = await loadAuthSession();
-        if (!session?.token) return;
+        await Sensors.start().catch(() => {});
 
-        const meResponse = await getCurrentUser(session.token);
-        if (cancelled) return;
-
-        setAuth({
-          token: session.token,
-          user: meResponse?.user || session.user || null,
-        });
-      } catch (_) {
-        await clearAuthSession();
+        const stored = await loadAuthSession();
+        if (!cancelled && stored?.token) {
+          authSessionRef.current = stored;
+          setAuthSession(stored);
+        }
       } finally {
         if (!cancelled) {
           setBooting(false);
@@ -90,191 +199,133 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      stopLocationPusher();
+      disconnectSocket();
+      Sensors.stop().catch(() => {});
     };
   }, []);
 
   useEffect(() => {
-    if (!auth?.token) return;
-
-    let didCancel = false;
-    let unsubscribeSensors = null;
-
-    async function startRuntime() {
-      try {
-        await Sensors.start();
-      } catch (err) {
-        Alert.alert('Location unavailable', err.message || 'Location permission was denied');
-      }
-
-      if (didCancel) return;
-
-      setSensorSnapshot(Sensors.getSnapshot());
-      unsubscribeSensors = Sensors.subscribeUpdates((_kind, snapshot) => {
-        setSensorSnapshot(snapshot);
-      });
-
-      const socket = connectSocket(auth.token);
-
-      const handleConnect = () => setSocketConnected(true);
-      const handleDisconnect = () => setSocketConnected(false);
-      const handleConnectError = async (error) => {
-        setSocketConnected(false);
-        const message = String(error?.message || '');
-        const isAuthIssue = /invalid token|authentication required/i.test(message);
-        if (isAuthIssue) {
-          await forceLogout('Session expired. Please log in again.');
-        }
-      };
-
-      socket.on('connect', handleConnect);
-      socket.on('disconnect', handleDisconnect);
-      socket.on('connect_error', handleConnectError);
-
-      if (socket.connected) {
-        setSocketConnected(true);
-      }
-
-      startLocationPusher();
-      await refreshChannels(auth.token);
-
-      const cleanupSocketListeners = () => {
-        socket.off('connect', handleConnect);
-        socket.off('disconnect', handleDisconnect);
-        socket.off('connect_error', handleConnectError);
-      };
-
-      if (didCancel) {
-        cleanupSocketListeners();
-      }
-
-      return cleanupSocketListeners;
+    const token = String(authSession?.token || '').trim();
+    if (!token) {
+      stopLocationPusher();
+      disconnectSocket();
+      return;
     }
 
-    let cleanupSocketListeners = null;
+    const socket = connectSocket(token);
 
-    startRuntime().then((cleanup) => {
-      cleanupSocketListeners = cleanup || null;
-    });
+    const handleConnectError = () => {};
+    socket.on('connect_error', handleConnectError);
+
+    startLocationPusher();
 
     return () => {
-      didCancel = true;
-
-      if (unsubscribeSensors) {
-        unsubscribeSensors();
-      }
-
-      if (cleanupSocketListeners) {
-        cleanupSocketListeners();
-      }
-
+      socket.off('connect_error', handleConnectError);
       stopLocationPusher();
-      setSocketConnected(false);
+      disconnectSocket();
     };
-  }, [auth?.token, forceLogout, refreshChannels]);
+  }, [authSession?.token]);
 
-  const handleLogin = useCallback(async (password) => {
-    setLoginLoading(true);
-    setAuthError('');
+  const handleWebMessage = useCallback((event) => {
+    const message = parseMessage(event?.nativeEvent?.data);
+    if (!message || typeof message !== 'object') return;
 
-    try {
-      const response = await loginWithPassword(password);
-      const token = response?.token;
-      const user = response?.user || null;
-
-      if (!token) {
-        throw new Error('Server did not return a token');
-      }
-
-      await saveAuthSession(token, user);
-      setAuth({ token, user });
-    } catch (err) {
-      setAuthError(err.message || 'Login failed');
-    } finally {
-      setLoginLoading(false);
-    }
-  }, []);
-
-  const handleLogout = useCallback(async () => {
-    await forceLogout('');
-  }, [forceLogout]);
-
-  const handleOpenChannel = useCallback((channel) => {
-    setActiveChannel(channel);
-  }, []);
-
-  const handleBackToChannels = useCallback(() => {
-    setActiveChannel(null);
-    const socket = getSocket();
-    if (socket?.connected && auth?.token) {
-      refreshChannels(auth.token);
-    }
-  }, [auth?.token, refreshChannels]);
-
-  const content = useMemo(() => {
-    if (booting) {
-      return (
-        <View style={s.bootWrap}>
-          <ActivityIndicator color="#22d3ee" />
-          <Text style={s.bootText}>Booting Eva Mobile...</Text>
-        </View>
-      );
+    if (message.type === 'eva-auth') {
+      setBridgeError('');
+      const token = message.isAuthenticated ? String(message.token || '').trim() : '';
+      updateSession(token ? { token, user: message.user || null } : null).catch((err) => {
+        setBridgeError(err?.message || 'Failed to sync auth state');
+      });
+      return;
     }
 
-    if (!auth?.token) {
-      return (
-        <LoginScreen
-          onSubmit={handleLogin}
-          loading={loginLoading}
-          error={authError}
-        />
-      );
+    if (message.type === 'eva-auth-error') {
+      setBridgeError(String(message.message || 'Auth bridge parse error'));
+      return;
     }
 
-    if (activeChannel) {
-      return (
-        <ChatScreen
-          token={auth.token}
-          user={authenticatedUser}
-          channel={activeChannel}
-          onBack={handleBackToChannels}
-        />
-      );
+    if (message.type === 'eva-route') {
+      setCurrentPath(urlPath(message.path || message.href || ''));
     }
+  }, [updateSession]);
 
+  const showLoginVersion = useMemo(() => {
+    return isLoginPath(currentPath);
+  }, [currentPath]);
+
+  if (booting) {
     return (
-      <ChannelListScreen
-        user={authenticatedUser}
-        channels={channels}
-        loading={channelsLoading}
-        onRefresh={() => refreshChannels(auth.token)}
-        onOpenChannel={handleOpenChannel}
-        onLogout={handleLogout}
-        socketConnected={socketConnected}
-        sensorSnapshot={sensorSnapshot}
-      />
+      <View style={s.bootWrap}>
+        <ExpoStatusBar style="light" translucent={false} backgroundColor="#070b16" />
+        <ActivityIndicator color="#22d3ee" />
+        <Text style={s.bootText}>Booting Eva Mobile...</Text>
+      </View>
     );
-  }, [
-    booting,
-    auth,
-    loginLoading,
-    authError,
-    activeChannel,
-    authenticatedUser,
-    channels,
-    channelsLoading,
-    handleBackToChannels,
-    handleLogin,
-    handleLogout,
-    handleOpenChannel,
-    refreshChannels,
-    sensorSnapshot,
-    socketConnected,
-  ]);
+  }
 
   return (
     <View style={s.root}>
-      <StatusBar style="light" />
-      {content}
+      <ExpoStatusBar style="light" translucent={false} backgroundColor="#070b16" />
+
+      <View style={s.webViewFrame}>
+        <WebView
+          key={webViewKey}
+          source={{ uri: EVA_WEB_URL }}
+          originWhitelist={['*']}
+          javaScriptEnabled
+          domStorageEnabled
+          sharedCookiesEnabled
+          thirdPartyCookiesEnabled
+          injectedJavaScriptBeforeContentLoaded={AUTH_BRIDGE_SCRIPT}
+          onMessage={handleWebMessage}
+          onNavigationStateChange={(navState) => {
+            setCurrentPath(urlPath(navState?.url || ''));
+          }}
+          onError={(event) => {
+            const description = String(event?.nativeEvent?.description || 'Failed to load web app');
+            setWebError(`${description} (${EVA_WEB_URL})`);
+          }}
+          onHttpError={(event) => {
+            const code = event?.nativeEvent?.statusCode;
+            const description = String(event?.nativeEvent?.description || 'WebView request failed');
+            setWebError(`HTTP ${code || 'error'}: ${description} (${EVA_WEB_URL})`);
+          }}
+          onLoadStart={() => {
+            setWebError('');
+          }}
+          startInLoadingState
+          renderLoading={() => (
+            <View style={s.webLoadingWrap}>
+              <ActivityIndicator color="#22d3ee" />
+              <Text style={s.webLoadingText}>Loading EVA Orchestrator...</Text>
+            </View>
+          )}
+        />
+      </View>
+
+      {(webError || bridgeError) ? (
+        <View style={s.errorOverlay}>
+          <Text style={s.errorTitle}>Connection issue</Text>
+          <Text style={s.errorText}>{webError || bridgeError}</Text>
+          <Pressable
+            style={s.retryButton}
+            onPress={() => {
+              setWebError('');
+              setBridgeError('');
+              setWebViewKey((value) => value + 1);
+            }}
+          >
+            <Text style={s.retryText}>Reload</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      {showLoginVersion ? (
+        <View pointerEvents="none" style={s.versionBadge}>
+          <Text style={s.versionText}>Eva Mobile v{APP_VERSION}</Text>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -282,10 +333,11 @@ export default function App() {
 const s = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#080f1e',
+    backgroundColor: '#070b16',
   },
   bootWrap: {
     flex: 1,
+    backgroundColor: '#070b16',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
@@ -293,5 +345,71 @@ const s = StyleSheet.create({
   bootText: {
     color: '#93c5fd',
     fontSize: 14,
+  },
+  webLoadingWrap: {
+    flex: 1,
+    backgroundColor: '#070b16',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  webViewFrame: {
+    flex: 1,
+    paddingTop: ANDROID_TOP_INSET,
+    backgroundColor: '#070b16',
+  },
+  webLoadingText: {
+    color: '#93c5fd',
+    fontSize: 13,
+  },
+  versionBadge: {
+    position: 'absolute',
+    top: ANDROID_TOP_INSET + 10,
+    right: 10,
+    backgroundColor: 'rgba(8, 15, 30, 0.85)',
+    borderWidth: 1,
+    borderColor: 'rgba(51, 65, 85, 0.8)',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  versionText: {
+    color: '#94a3b8',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  errorOverlay: {
+    position: 'absolute',
+    top: ANDROID_TOP_INSET + 56,
+    left: 14,
+    right: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#7f1d1d',
+    backgroundColor: 'rgba(69, 10, 10, 0.95)',
+    padding: 12,
+    gap: 8,
+  },
+  errorTitle: {
+    color: '#fecaca',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  errorText: {
+    color: '#fee2e2',
+    fontSize: 12,
+  },
+  retryButton: {
+    alignSelf: 'flex-start',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#fca5a5',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  retryText: {
+    color: '#fee2e2',
+    fontSize: 12,
+    fontWeight: '700',
   },
 });

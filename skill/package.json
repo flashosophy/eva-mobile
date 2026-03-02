@@ -5,6 +5,7 @@
   "private": true,
   "main": "eva-mobile-locate.js",
   "bin": {
-    "eva-mobile-locate": "./eva-mobile-locate.js"
+    "eva-mobile-locate": "./eva-mobile-locate.js",
+    "jun-sense-connect": "./jun-sense-connect.js"
   }
 }
