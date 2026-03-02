@@ -49,6 +49,14 @@
           "color": "#1a1a2e"
         }
       ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
       "expo-secure-store"
     ],
     "owner": "flashosophy",

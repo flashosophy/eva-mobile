@@ -1,4 +1,4 @@
-const DEFAULT_EVA_CORE_URL = 'https://eva.tail5afb5a.ts.net:3456';
+const DEFAULT_EVA_CORE_URL = 'http://eva.tail5afb5a.ts.net:3456';
 
 function sanitizeBaseUrl(value, fallback = DEFAULT_EVA_CORE_URL) {
   const raw = String(value || '').trim();

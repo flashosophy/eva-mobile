@@ -19,11 +19,19 @@ async function request(path, { method = 'GET', token = null, body } = {}) {
     headers['content-type'] = 'application/json';
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    const message = err?.message || 'Unknown network error';
+    const error = new Error(`Network error contacting ${API_BASE}: ${message}`);
+    error.status = 0;
+    throw error;
+  }
 
   const payload = await parseResponse(response);
   if (!response.ok) {
