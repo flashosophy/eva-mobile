@@ -1,26 +1,43 @@
 /**
  * sensors.js
- * Manages GPS location, activity recognition, and battery state.
- * Keeps a live snapshot in memory; relay.js reads from it on demand.
+ * Manages GPS location and battery state.
+ * Keeps a live snapshot in memory for UI and location push services.
  */
 
 import * as Location from 'expo-location';
 import * as Battery from 'expo-battery';
 import * as TaskManager from 'expo-task-manager';
 
-const LOCATION_TASK = 'jun-sense-location';
+const LOCATION_TASK = 'eva-mobile-location';
 const POLL_INTERVAL_MS = 30_000;
 
 // In-memory snapshot — updated by both foreground poll and background task
 let _snapshot = {
-  location: null,   // { lat, lng, accuracy, altitude, speed, heading, ts }
-  activity: null,   // { type, confidence, ts }
-  battery: null,    // { level, charging, ts }
+  location: null, // { lat, lng, accuracy, altitude, speed, heading, ts }
+  battery: null, // { level, charging, ts }
 };
 
 let _pollTimer = null;
 let _locationSubscription = null;
-let _onUpdate = null; // callback so relay.js knows when data changes
+let _started = false;
+let _legacyUpdateCallback = null;
+const _listeners = new Set();
+
+function _emitUpdate(kind) {
+  const snapshot = getSnapshot();
+
+  if (typeof _legacyUpdateCallback === 'function') {
+    try {
+      _legacyUpdateCallback(kind, snapshot);
+    } catch (_) {}
+  }
+
+  for (const listener of _listeners) {
+    try {
+      listener(kind, snapshot);
+    } catch (_) {}
+  }
+}
 
 // --- Background task definition (must be at module level) ---
 
@@ -29,20 +46,37 @@ TaskManager.defineTask(LOCATION_TASK, ({ data, error }) => {
   if (!data?.locations?.length) return;
   const loc = data.locations[data.locations.length - 1];
   _snapshot.location = _parseLocation(loc);
-  if (_onUpdate) _onUpdate('location');
+  _emitUpdate('location');
 });
 
 // --- Public API ---
 
 export function setUpdateCallback(fn) {
-  _onUpdate = fn;
+  _legacyUpdateCallback = typeof fn === 'function' ? fn : null;
+}
+
+export function subscribeUpdates(listener) {
+  if (typeof listener !== 'function') {
+    return () => {};
+  }
+
+  _listeners.add(listener);
+  return () => {
+    _listeners.delete(listener);
+  };
 }
 
 export function getSnapshot() {
   return { ..._snapshot };
 }
 
+export function isStarted() {
+  return _started;
+}
+
 export async function start() {
+  if (_started) return;
+
   // Request permissions
   const fgPerm = await Location.requestForegroundPermissionsAsync();
   if (fgPerm.status !== 'granted') {
@@ -59,7 +93,7 @@ export async function start() {
     },
     (loc) => {
       _snapshot.location = _parseLocation(loc);
-      if (_onUpdate) _onUpdate('location');
+      _emitUpdate('location');
     }
   );
 
@@ -72,8 +106,8 @@ export async function start() {
         timeInterval: POLL_INTERVAL_MS,
         distanceInterval: 10,
         foregroundService: {
-          notificationTitle: 'Eva Locate',
-          notificationBody: 'Sharing location with Eva',
+          notificationTitle: 'Eva Mobile - location active',
+          notificationBody: 'Background location is running',
           notificationColor: '#1a1a2e',
         },
         pausesUpdatesAutomatically: false,
@@ -82,12 +116,15 @@ export async function start() {
     }
   }
 
-  // Poll battery + activity on an interval
+  // Poll battery on an interval
   await _pollBattery();
   _pollTimer = setInterval(_pollBattery, POLL_INTERVAL_MS);
+  _started = true;
 }
 
 export async function stop() {
+  if (!_started) return;
+
   if (_locationSubscription) {
     _locationSubscription.remove();
     _locationSubscription = null;
@@ -100,6 +137,8 @@ export async function stop() {
     clearInterval(_pollTimer);
     _pollTimer = null;
   }
+
+  _started = false;
 }
 
 // --- Internal ---
@@ -127,6 +166,6 @@ async function _pollBattery() {
       charging: state === Battery.BatteryState.CHARGING || state === Battery.BatteryState.FULL,
       ts: Date.now(),
     };
-    if (_onUpdate) _onUpdate('battery');
+    _emitUpdate('battery');
   } catch (_) {}
 }

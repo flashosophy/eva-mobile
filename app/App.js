@@ -1,193 +1,280 @@
-/**
- * App.js — Eva Locate
- * Single screen: connection status, current readings, pair code generator.
- */
-
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Platform,
-  Pressable,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import * as Notifications from 'expo-notifications';
 
+import LoginScreen from './screens/LoginScreen';
+import ChannelListScreen from './screens/ChannelListScreen';
+import ChatScreen from './screens/ChatScreen';
+import { getChannels, getCurrentUser, loginWithPassword } from './service/api';
+import { startLocationPusher, stopLocationPusher } from './service/location-pusher';
+import { connectSocket, disconnectSocket, getSocket } from './service/socket';
 import * as Sensors from './service/sensors';
-import * as Relay from './service/relay';
-
-const RELAY_PAIR_ENDPOINT = 'https://eva.tail5afb5a.ts.net:8443/pair';
-
-// Keep notifications visible while in foreground
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: false,
-    shouldPlaySound: false,
-    shouldSetBadge: false,
-  }),
-});
-
-function generateCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no ambiguous chars
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
-}
+import { clearAuthSession, loadAuthSession, saveAuthSession } from './store/auth';
 
 export default function App() {
-  const [relayStatus, setRelayStatus] = useState('disconnected'); // connecting|connected|disconnected
-  const [sensorsStarted, setSensorsStarted] = useState(false);
-  const [pairCode, setPairCode] = useState(null);
-  const [pairExpiry, setPairExpiry] = useState(null);
-  const [pairing, setPairing] = useState(false);
-  const [snapshot, setSnapshot] = useState({ location: null, battery: null });
-  const expiryTimer = useRef(null);
+  const [booting, setBooting] = useState(true);
+  const [auth, setAuth] = useState(null);
+  const [authError, setAuthError] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
 
-  // Start sensors on mount
+  const [channels, setChannels] = useState([]);
+  const [channelsLoading, setChannelsLoading] = useState(false);
+  const [activeChannel, setActiveChannel] = useState(null);
+
+  const [socketConnected, setSocketConnected] = useState(false);
+  const [sensorSnapshot, setSensorSnapshot] = useState(Sensors.getSnapshot());
+
+  const authenticatedUser = auth?.user || null;
+
+  const refreshChannels = useCallback(async (token) => {
+    const effectiveToken = String(token || auth?.token || '').trim();
+    if (!effectiveToken) return;
+
+    setChannelsLoading(true);
+    try {
+      const response = await getChannels(effectiveToken);
+      setChannels(Array.isArray(response?.channels) ? response.channels : []);
+    } catch (err) {
+      setChannels([]);
+      Alert.alert('Channels unavailable', err.message || 'Could not load channels');
+    } finally {
+      setChannelsLoading(false);
+    }
+  }, [auth?.token]);
+
+  const forceLogout = useCallback(async (message = '') => {
+    stopLocationPusher();
+    disconnectSocket();
+    await Sensors.stop().catch(() => {});
+    await clearAuthSession();
+
+    setAuth(null);
+    setChannels([]);
+    setActiveChannel(null);
+    setSocketConnected(false);
+    setSensorSnapshot(Sensors.getSnapshot());
+    setAuthError(message);
+  }, []);
+
   useEffect(() => {
-    (async () => {
-      try {
-        Sensors.setUpdateCallback(() => {
-          setSnapshot(Sensors.getSnapshot());
-        });
-        await Sensors.start();
-        setSensorsStarted(true);
-      } catch (e) {
-        Alert.alert('Permission required', e.message);
-      }
-    })();
+    let cancelled = false;
 
-    Relay.setStatusCallback(setRelayStatus);
+    async function bootstrap() {
+      try {
+        const session = await loadAuthSession();
+        if (!session?.token) return;
+
+        const meResponse = await getCurrentUser(session.token);
+        if (cancelled) return;
+
+        setAuth({
+          token: session.token,
+          user: meResponse?.user || session.user || null,
+        });
+      } catch (_) {
+        await clearAuthSession();
+      } finally {
+        if (!cancelled) {
+          setBooting(false);
+        }
+      }
+    }
+
+    bootstrap();
 
     return () => {
-      Sensors.stop();
-      Relay.disconnect();
+      cancelled = true;
     };
   }, []);
 
-  // Clear pair code when it expires
   useEffect(() => {
-    if (!pairExpiry) return;
-    const remaining = pairExpiry - Date.now();
-    if (remaining <= 0) { setPairCode(null); setPairExpiry(null); return; }
-    expiryTimer.current = setTimeout(() => {
-      setPairCode(null);
-      setPairExpiry(null);
-    }, remaining);
-    return () => clearTimeout(expiryTimer.current);
-  }, [pairExpiry]);
+    if (!auth?.token) return;
 
-  async function handleGenerateCode() {
-    if (pairing) return;
-    setPairing(true);
-    setPairCode(null);
-    try {
-      const code = generateCode();
-      const res = await fetch(RELAY_PAIR_ENDPOINT, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ code }),
+    let didCancel = false;
+    let unsubscribeSensors = null;
+
+    async function startRuntime() {
+      try {
+        await Sensors.start();
+      } catch (err) {
+        Alert.alert('Location unavailable', err.message || 'Location permission was denied');
+      }
+
+      if (didCancel) return;
+
+      setSensorSnapshot(Sensors.getSnapshot());
+      unsubscribeSensors = Sensors.subscribeUpdates((_kind, snapshot) => {
+        setSensorSnapshot(snapshot);
       });
-      if (!res.ok) throw new Error(`Relay error: ${res.status}`);
-      const { session_token, expires_at_ms } = await res.json();
 
-      setPairCode(code);
-      setPairExpiry(expires_at_ms);
+      const socket = connectSocket(auth.token);
 
-      // Connect to relay as the app (MCP server role)
-      Relay.connect(session_token);
-    } catch (e) {
-      Alert.alert('Pairing failed', e.message);
-    } finally {
-      setPairing(false);
+      const handleConnect = () => setSocketConnected(true);
+      const handleDisconnect = () => setSocketConnected(false);
+      const handleConnectError = async (error) => {
+        setSocketConnected(false);
+        const message = String(error?.message || '');
+        const isAuthIssue = /invalid token|authentication required/i.test(message);
+        if (isAuthIssue) {
+          await forceLogout('Session expired. Please log in again.');
+        }
+      };
+
+      socket.on('connect', handleConnect);
+      socket.on('disconnect', handleDisconnect);
+      socket.on('connect_error', handleConnectError);
+
+      if (socket.connected) {
+        setSocketConnected(true);
+      }
+
+      startLocationPusher();
+      await refreshChannels(auth.token);
+
+      const cleanupSocketListeners = () => {
+        socket.off('connect', handleConnect);
+        socket.off('disconnect', handleDisconnect);
+        socket.off('connect_error', handleConnectError);
+      };
+
+      if (didCancel) {
+        cleanupSocketListeners();
+      }
+
+      return cleanupSocketListeners;
     }
-  }
 
-  const loc = snapshot.location;
-  const bat = snapshot.battery;
+    let cleanupSocketListeners = null;
 
-  const statusColor =
-    relayStatus === 'connected' ? '#4ade80' :
-    relayStatus === 'connecting' ? '#facc15' : '#6b7280';
+    startRuntime().then((cleanup) => {
+      cleanupSocketListeners = cleanup || null;
+    });
 
-  const statusLabel =
-    relayStatus === 'connected' ? 'Connected to Eva' :
-    relayStatus === 'connecting' ? 'Connecting...' : 'Disconnected';
+    return () => {
+      didCancel = true;
 
-  const expiresIn = pairExpiry ? Math.max(0, Math.round((pairExpiry - Date.now()) / 1000)) : 0;
+      if (unsubscribeSensors) {
+        unsubscribeSensors();
+      }
+
+      if (cleanupSocketListeners) {
+        cleanupSocketListeners();
+      }
+
+      stopLocationPusher();
+      setSocketConnected(false);
+    };
+  }, [auth?.token, forceLogout, refreshChannels]);
+
+  const handleLogin = useCallback(async (password) => {
+    setLoginLoading(true);
+    setAuthError('');
+
+    try {
+      const response = await loginWithPassword(password);
+      const token = response?.token;
+      const user = response?.user || null;
+
+      if (!token) {
+        throw new Error('Server did not return a token');
+      }
+
+      await saveAuthSession(token, user);
+      setAuth({ token, user });
+    } catch (err) {
+      setAuthError(err.message || 'Login failed');
+    } finally {
+      setLoginLoading(false);
+    }
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    await forceLogout('');
+  }, [forceLogout]);
+
+  const handleOpenChannel = useCallback((channel) => {
+    setActiveChannel(channel);
+  }, []);
+
+  const handleBackToChannels = useCallback(() => {
+    setActiveChannel(null);
+    const socket = getSocket();
+    if (socket?.connected && auth?.token) {
+      refreshChannels(auth.token);
+    }
+  }, [auth?.token, refreshChannels]);
+
+  const content = useMemo(() => {
+    if (booting) {
+      return (
+        <View style={s.bootWrap}>
+          <ActivityIndicator color="#22d3ee" />
+          <Text style={s.bootText}>Booting Eva Mobile...</Text>
+        </View>
+      );
+    }
+
+    if (!auth?.token) {
+      return (
+        <LoginScreen
+          onSubmit={handleLogin}
+          loading={loginLoading}
+          error={authError}
+        />
+      );
+    }
+
+    if (activeChannel) {
+      return (
+        <ChatScreen
+          token={auth.token}
+          user={authenticatedUser}
+          channel={activeChannel}
+          onBack={handleBackToChannels}
+        />
+      );
+    }
+
+    return (
+      <ChannelListScreen
+        user={authenticatedUser}
+        channels={channels}
+        loading={channelsLoading}
+        onRefresh={() => refreshChannels(auth.token)}
+        onOpenChannel={handleOpenChannel}
+        onLogout={handleLogout}
+        socketConnected={socketConnected}
+        sensorSnapshot={sensorSnapshot}
+      />
+    );
+  }, [
+    booting,
+    auth,
+    loginLoading,
+    authError,
+    activeChannel,
+    authenticatedUser,
+    channels,
+    channelsLoading,
+    handleBackToChannels,
+    handleLogin,
+    handleLogout,
+    handleOpenChannel,
+    refreshChannels,
+    sensorSnapshot,
+    socketConnected,
+  ]);
 
   return (
     <View style={s.root}>
       <StatusBar style="light" />
-
-      {/* Header */}
-      <View style={s.header}>
-        <Text style={s.title}>Eva Locate</Text>
-        <View style={s.statusRow}>
-          <View style={[s.dot, { backgroundColor: statusColor }]} />
-          <Text style={[s.statusText, { color: statusColor }]}>{statusLabel}</Text>
-        </View>
-      </View>
-
-      {/* Readings */}
-      <View style={s.card}>
-        <Text style={s.cardLabel}>Location</Text>
-        {loc ? (
-          <>
-            <Text style={s.value}>{loc.lat.toFixed(6)}, {loc.lng.toFixed(6)}</Text>
-            <Text style={s.sub}>
-              ±{Math.round(loc.accuracy)}m
-              {loc.speed != null && loc.speed > 0.5 ? `  ·  ${(loc.speed * 3.6).toFixed(1)} km/h` : ''}
-              {loc.altitude != null ? `  ·  ${Math.round(loc.altitude)}m alt` : ''}
-            </Text>
-          </>
-        ) : (
-          <Text style={s.waiting}>
-            {sensorsStarted ? 'Getting fix...' : 'Starting sensors...'}
-          </Text>
-        )}
-      </View>
-
-      <View style={s.card}>
-        <Text style={s.cardLabel}>Battery</Text>
-        {bat ? (
-          <Text style={s.value}>
-            {bat.level}%{bat.charging ? '  ⚡ charging' : ''}
-          </Text>
-        ) : (
-          <Text style={s.waiting}>Reading...</Text>
-        )}
-      </View>
-
-      {/* Pair section */}
-      <View style={s.pairSection}>
-        {pairCode ? (
-          <>
-            <Text style={s.pairLabel}>Give Eva this code:</Text>
-            <Text style={s.pairCode}>{pairCode}</Text>
-            <Text style={s.pairExpiry}>Expires in {expiresIn}s</Text>
-            <Text style={s.pairHint}>
-              Run: jun-sense-connect pair {pairCode}
-            </Text>
-          </>
-        ) : (
-          <Pressable
-            style={[s.button, pairing && s.buttonDisabled]}
-            onPress={handleGenerateCode}
-            disabled={pairing}
-          >
-            {pairing
-              ? <ActivityIndicator color="#fff" />
-              : <Text style={s.buttonText}>Generate Pair Code</Text>
-            }
-          </Pressable>
-        )}
-      </View>
+      {content}
     </View>
   );
 }
@@ -195,107 +282,16 @@ export default function App() {
 const s = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#0a0a0a',
-    paddingTop: Platform.OS === 'android' ? 48 : 60,
-    paddingHorizontal: 20,
+    backgroundColor: '#080f1e',
   },
-  header: {
-    marginBottom: 28,
-  },
-  title: {
-    fontSize: 26,
-    fontWeight: '700',
-    color: '#f4f4f5',
-    letterSpacing: 0.5,
-    marginBottom: 8,
-  },
-  statusRow: {
-    flexDirection: 'row',
+  bootWrap: {
+    flex: 1,
     alignItems: 'center',
-    gap: 8,
+    justifyContent: 'center',
+    gap: 10,
   },
-  dot: {
-    width: 9,
-    height: 9,
-    borderRadius: 5,
-  },
-  statusText: {
+  bootText: {
+    color: '#93c5fd',
     fontSize: 14,
-    fontWeight: '500',
-  },
-  card: {
-    backgroundColor: '#18181b',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#27272a',
-  },
-  cardLabel: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#71717a',
-    letterSpacing: 1,
-    textTransform: 'uppercase',
-    marginBottom: 6,
-  },
-  value: {
-    fontSize: 17,
-    color: '#f4f4f5',
-    fontVariant: ['tabular-nums'],
-    fontWeight: '500',
-  },
-  sub: {
-    fontSize: 13,
-    color: '#71717a',
-    marginTop: 4,
-  },
-  waiting: {
-    fontSize: 15,
-    color: '#52525b',
-    fontStyle: 'italic',
-  },
-  pairSection: {
-    marginTop: 20,
-    alignItems: 'center',
-  },
-  button: {
-    backgroundColor: '#1d4ed8',
-    paddingVertical: 14,
-    paddingHorizontal: 32,
-    borderRadius: 10,
-    minWidth: 220,
-    alignItems: 'center',
-  },
-  buttonDisabled: {
-    opacity: 0.5,
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  pairLabel: {
-    color: '#71717a',
-    fontSize: 13,
-    marginBottom: 8,
-  },
-  pairCode: {
-    fontSize: 44,
-    fontWeight: '800',
-    color: '#f4f4f5',
-    letterSpacing: 8,
-    fontVariant: ['tabular-nums'],
-  },
-  pairExpiry: {
-    color: '#71717a',
-    fontSize: 12,
-    marginTop: 6,
-  },
-  pairHint: {
-    color: '#3f3f46',
-    fontSize: 11,
-    marginTop: 12,
-    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier',
   },
 });

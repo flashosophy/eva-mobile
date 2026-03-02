@@ -1,13 +1,10 @@
 {
-  "name": "jun-sense-skill",
+  "name": "eva-mobile-skill",
   "version": "1.0.0",
-  "description": "OpenClaw skill — read Jun's phone location and battery via self-hosted relay",
+  "description": "OpenClaw skill — read Eva Mobile location and battery from EVA Core",
   "private": true,
-  "main": "jun-sense-connect.js",
+  "main": "eva-mobile-locate.js",
   "bin": {
-    "jun-sense-connect": "./jun-sense-connect.js"
-  },
-  "dependencies": {
-    "ws": "^8.16.0"
+    "eva-mobile-locate": "./eva-mobile-locate.js"
   }
 }

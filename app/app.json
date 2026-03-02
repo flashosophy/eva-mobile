@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "Eva Locate",
-    "slug": "eva-locate",
+    "name": "Eva Mobile",
+    "slug": "eva-mobile",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -12,7 +12,7 @@
       "backgroundColor": "#0a0a0a"
     },
     "android": {
-      "package": "com.flashosophy.evalocate",
+      "package": "com.flashosophy.evamobile",
       "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
@@ -36,8 +36,8 @@
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Eva Locate needs location access so Eva can know where you are.",
-          "locationAlwaysPermission": "Eva Locate needs background location access so Eva can know where you are when the app is in the background.",
+          "locationAlwaysAndWhenInUsePermission": "Eva Mobile needs location access so Eva can know where you are.",
+          "locationAlwaysPermission": "Eva Mobile needs background location access so Eva can know where you are when the app is in the background.",
           "isAndroidBackgroundLocationEnabled": true,
           "isAndroidForegroundServiceEnabled": true
         }
@@ -48,13 +48,14 @@
           "icon": "./assets/notification-icon.png",
           "color": "#1a1a2e"
         }
-      ]
+      ],
+      "expo-secure-store"
     ],
+    "owner": "flashosophy",
     "extra": {
       "eas": {
-        "projectId": "fce3317a-fe40-4667-85f4-93a9288a2828"
+        "projectId": "22e98322-5fe0-4089-b5e8-d8516c9b3ede"
       }
-    },
-    "owner": "flashosophy"
+    }
   }
 }

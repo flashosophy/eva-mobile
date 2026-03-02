@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build.sh — log into EAS and build the APK
-# Run this once from ~/git/eva-gps/
+# Run this once from ~/git/eva-mobile/
 set -e
 
 cd "$(dirname "$0")/app"
