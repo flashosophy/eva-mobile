@@ -11,6 +11,10 @@
  * URIs:
  *   eva-mobile://location
  *   eva-mobile://battery
+ *   eva-mobile://nearby-places
+ *   eva-mobile://nearby/restaurants
+ *   eva-mobile://nearby/stores
+ *   eva-mobile://nearby/gas
  */
 
 'use strict';
@@ -24,8 +28,31 @@ const EVA_CORE_SERVICE_TOKEN = String(
 ).trim();
 const EVA_CORE_LOCATION_USER_ID = String(process.env.EVA_CORE_LOCATION_USER_ID || 'user-jun').trim();
 
+const EVA_CORE_NEARBY_RADIUS_METERS = toBoundedInteger(process.env.EVA_CORE_NEARBY_RADIUS_METERS, null, {
+  min: 25,
+  max: 5000,
+});
+const EVA_CORE_NEARBY_LIMIT = toBoundedInteger(process.env.EVA_CORE_NEARBY_LIMIT, null, {
+  min: 1,
+  max: 50,
+});
+
 const LOCATION_URI = 'eva-mobile://location';
 const BATTERY_URI = 'eva-mobile://battery';
+const NEARBY_PLACES_URI = 'eva-mobile://nearby-places';
+const NEARBY_ALIAS_URI = 'eva-mobile://nearby';
+const NEARBY_RESTAURANTS_URI = 'eva-mobile://nearby/restaurants';
+const NEARBY_STORES_URI = 'eva-mobile://nearby/stores';
+const NEARBY_GAS_URI = 'eva-mobile://nearby/gas';
+
+function toBoundedInteger(value, fallback = null, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  const rounded = Math.round(parsed);
+  if (rounded < min) return min;
+  if (rounded > max) return max;
+  return rounded;
+}
 
 function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
@@ -39,6 +66,14 @@ function die(code, message) {
 function requireServiceToken() {
   if (EVA_CORE_SERVICE_TOKEN) return;
   die('NO_SERVICE_TOKEN', 'Set EVA_CORE_SERVICE_TOKEN (or SERVICE_TOKEN) to query EVA Core location API.');
+}
+
+async function readJsonSafe(response) {
+  try {
+    return await response.json();
+  } catch (_err) {
+    return null;
+  }
 }
 
 function normalizeLocationPayload(location) {
@@ -85,6 +120,112 @@ function normalizeBatteryPayload(location) {
   };
 }
 
+function normalizeNearbyPlace(place) {
+  if (!place || typeof place !== 'object') return null;
+
+  const id = String(place.id || '').trim();
+  const name = String(place.name || '').trim();
+  const lat = Number(place.lat);
+  const lng = Number(place.lng);
+  const distanceMeters = Number.isFinite(Number(place.distanceMeters))
+    ? Number(place.distanceMeters)
+    : null;
+
+  if (!id || !name || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+
+  return {
+    id,
+    name,
+    kind: String(place.kind || '').trim() || 'other',
+    category: String(place.category || '').trim() || null,
+    categoryLabel: String(place.categoryLabel || '').trim() || null,
+    distanceMeters,
+    lat,
+    lng,
+    address: String(place.address || '').trim() || null,
+  };
+}
+
+function normalizeNearbyPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return { available: false, reason: 'No nearby places payload returned' };
+  }
+
+  const places = Array.isArray(payload.places)
+    ? payload.places.map(normalizeNearbyPlace).filter(Boolean)
+    : [];
+
+  const recognitionSource = payload.recognition && typeof payload.recognition === 'object'
+    ? payload.recognition
+    : null;
+
+  const recognition = {
+    available: recognitionSource?.available === true,
+    statement: String(recognitionSource?.statement || '').trim()
+      || (places[0] ? `You're near ${places[0].name}.` : null),
+    relation: String(recognitionSource?.relation || '').trim() || null,
+    confidence: String(recognitionSource?.confidence || '').trim() || null,
+    placeId: String(recognitionSource?.placeId || '').trim() || null,
+    placeName: String(recognitionSource?.placeName || '').trim() || null,
+    distanceMeters: Number.isFinite(Number(recognitionSource?.distanceMeters))
+      ? Number(recognitionSource.distanceMeters)
+      : null,
+  };
+
+  const centerSource = payload.center && typeof payload.center === 'object'
+    ? payload.center
+    : null;
+
+  const center = centerSource
+    ? {
+        userId: String(centerSource.userId || '').trim() || null,
+        lat: Number.isFinite(Number(centerSource.lat)) ? Number(centerSource.lat) : null,
+        lng: Number.isFinite(Number(centerSource.lng)) ? Number(centerSource.lng) : null,
+        accuracy: Number.isFinite(Number(centerSource.accuracy)) ? Number(centerSource.accuracy) : null,
+        ts: Number.isFinite(Number(centerSource.ts)) ? Number(centerSource.ts) : null,
+        staleSeconds: Number.isFinite(Number(centerSource.staleSeconds))
+          ? Number(centerSource.staleSeconds)
+          : null,
+      }
+    : null;
+
+  const querySource = payload.query && typeof payload.query === 'object'
+    ? payload.query
+    : null;
+
+  const query = {
+    radiusMeters: Number.isFinite(Number(querySource?.radiusMeters))
+      ? Number(querySource.radiusMeters)
+      : null,
+    limit: Number.isFinite(Number(querySource?.limit)) ? Number(querySource.limit) : null,
+    kinds: Array.isArray(querySource?.kinds)
+      ? querySource.kinds.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [],
+  };
+
+  return {
+    available: true,
+    source: String(payload.source || 'openstreetmap-overpass').trim() || 'openstreetmap-overpass',
+    statement: recognition.statement,
+    recognition,
+    center,
+    query,
+    places,
+    count: places.length,
+    cache: payload.cache && typeof payload.cache === 'object' ? payload.cache : null,
+    warning: String(payload.warning || '').trim() || null,
+    attribution: payload.attribution && typeof payload.attribution === 'object'
+      ? {
+          text: String(payload.attribution.text || '').trim() || null,
+          url: String(payload.attribution.url || '').trim() || null,
+        }
+      : null,
+    fetchedAt: String(payload.fetchedAt || '').trim() || null,
+  };
+}
+
 async function fetchLocationRecord() {
   requireServiceToken();
 
@@ -97,12 +238,7 @@ async function fetchLocationRecord() {
     },
   });
 
-  let payload = null;
-  try {
-    payload = await response.json();
-  } catch (_err) {
-    payload = null;
-  }
+  const payload = await readJsonSafe(response);
 
   if (!response.ok) {
     if (response.status === 404) {
@@ -120,6 +256,90 @@ async function fetchLocationRecord() {
     found: true,
     location: payload?.location || null,
   };
+}
+
+function buildNearbyQuerySuffix(kind) {
+  const search = new URLSearchParams();
+
+  if (kind) {
+    search.set('kinds', kind);
+  }
+
+  if (EVA_CORE_NEARBY_RADIUS_METERS != null) {
+    search.set('radius', String(EVA_CORE_NEARBY_RADIUS_METERS));
+  }
+
+  if (EVA_CORE_NEARBY_LIMIT != null) {
+    search.set('limit', String(EVA_CORE_NEARBY_LIMIT));
+  }
+
+  const query = search.toString();
+  return query ? `?${query}` : '';
+}
+
+async function fetchNearbyPlacesRecord({ kind = '' } = {}) {
+  requireServiceToken();
+
+  const targetUserId = encodeURIComponent(EVA_CORE_LOCATION_USER_ID);
+  const suffix = buildNearbyQuerySuffix(kind);
+
+  const response = await fetch(`${EVA_CORE_URL}/api/location/${targetUserId}/nearby-places${suffix}`, {
+    method: 'GET',
+    headers: {
+      'x-service-token': EVA_CORE_SERVICE_TOKEN,
+      'content-type': 'application/json',
+    },
+  });
+
+  const payload = await readJsonSafe(response);
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      return {
+        found: false,
+        nearby: null,
+      };
+    }
+
+    const reason = payload?.error || `HTTP ${response.status}`;
+    throw new Error(reason);
+  }
+
+  return {
+    found: true,
+    nearby: payload || null,
+  };
+}
+
+function resolveReadRequest(uri) {
+  const normalizedUri = String(uri || '').trim();
+  if (!normalizedUri) return null;
+
+  if (normalizedUri === LOCATION_URI) {
+    return { type: 'location', uri: LOCATION_URI, nearbyKind: '' };
+  }
+
+  if (normalizedUri === BATTERY_URI) {
+    return { type: 'battery', uri: BATTERY_URI, nearbyKind: '' };
+  }
+
+  if (normalizedUri === NEARBY_PLACES_URI || normalizedUri === NEARBY_ALIAS_URI) {
+    return { type: 'nearby', uri: NEARBY_PLACES_URI, nearbyKind: '' };
+  }
+
+  if (normalizedUri === NEARBY_RESTAURANTS_URI) {
+    return { type: 'nearby', uri: NEARBY_RESTAURANTS_URI, nearbyKind: 'restaurant' };
+  }
+
+  if (normalizedUri === NEARBY_STORES_URI) {
+    return { type: 'nearby', uri: NEARBY_STORES_URI, nearbyKind: 'store' };
+  }
+
+  if (normalizedUri === NEARBY_GAS_URI) {
+    return { type: 'nearby', uri: NEARBY_GAS_URI, nearbyKind: 'gas' };
+  }
+
+  return null;
 }
 
 async function cmdStatus() {
@@ -162,24 +382,39 @@ async function cmdStatus() {
 }
 
 async function cmdRead(uri) {
-  const normalizedUri = String(uri || '').trim();
-  if (!normalizedUri) {
-    die('USAGE', 'read <uri>');
-  }
-
-  let requestedType = null;
-  if (normalizedUri === LOCATION_URI) requestedType = 'location';
-  if (normalizedUri === BATTERY_URI) requestedType = 'battery';
-  if (!requestedType) {
-    die('UNKNOWN_URI', `Unknown URI: ${normalizedUri}`);
+  const request = resolveReadRequest(uri);
+  if (!request) {
+    die('UNKNOWN_URI', `Unknown URI: ${String(uri || '').trim()}`);
   }
 
   try {
+    if (request.type === 'nearby') {
+      const { found, nearby } = await fetchNearbyPlacesRecord({ kind: request.nearbyKind });
+      if (!found) {
+        emit({
+          type: 'resource',
+          uri: request.uri,
+          data: {
+            available: false,
+            reason: 'No location record available yet',
+          },
+        });
+        return;
+      }
+
+      emit({
+        type: 'resource',
+        uri: request.uri,
+        data: normalizeNearbyPayload(nearby),
+      });
+      return;
+    }
+
     const { found, location } = await fetchLocationRecord();
     if (!found) {
       emit({
         type: 'resource',
-        uri: requestedType === 'location' ? LOCATION_URI : BATTERY_URI,
+        uri: request.uri,
         data: {
           available: false,
           reason: 'No location record available yet',
@@ -188,13 +423,13 @@ async function cmdRead(uri) {
       return;
     }
 
-    const data = requestedType === 'location'
+    const data = request.type === 'location'
       ? normalizeLocationPayload(location)
       : normalizeBatteryPayload(location);
 
     emit({
       type: 'resource',
-      uri: requestedType === 'location' ? LOCATION_URI : BATTERY_URI,
+      uri: request.uri,
       data,
     });
   } catch (err) {
@@ -218,6 +453,30 @@ function cmdListResources() {
         description: 'Last known battery level from Eva Mobile',
         mimeType: 'application/json',
       },
+      {
+        uri: NEARBY_PLACES_URI,
+        name: 'Nearby Places',
+        description: 'Nearby OpenStreetMap places plus recognition statement',
+        mimeType: 'application/json',
+      },
+      {
+        uri: NEARBY_RESTAURANTS_URI,
+        name: 'Nearby Restaurants',
+        description: 'Nearby restaurants, cafes, and food places',
+        mimeType: 'application/json',
+      },
+      {
+        uri: NEARBY_STORES_URI,
+        name: 'Nearby Stores',
+        description: 'Nearby stores and shopping places',
+        mimeType: 'application/json',
+      },
+      {
+        uri: NEARBY_GAS_URI,
+        name: 'Nearby Gas',
+        description: 'Nearby gas stations and fuel stops',
+        mimeType: 'application/json',
+      },
     ],
   });
 }
@@ -230,6 +489,9 @@ async function main() {
       await cmdStatus();
       break;
     case 'read':
+      if (!rest[0]) {
+        die('USAGE', 'read <uri>');
+      }
       await cmdRead(rest[0]);
       break;
     case 'list-resources':
@@ -242,6 +504,10 @@ async function main() {
         '  read <uri>',
         '    eva-mobile://location',
         '    eva-mobile://battery',
+        '    eva-mobile://nearby-places',
+        '    eva-mobile://nearby/restaurants',
+        '    eva-mobile://nearby/stores',
+        '    eva-mobile://nearby/gas',
         '  list-resources',
       ].join('\n'));
   }
