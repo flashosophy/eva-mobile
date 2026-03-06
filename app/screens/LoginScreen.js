@@ -10,9 +10,7 @@ import {
   View,
 } from 'react-native';
 
-import { EVA_CORE_URL } from '../config';
-
-const APP_VERSION = '1.0.2';
+import { APP_VERSION, EVA_CORE_URL } from '../config';
 
 export default function LoginScreen({ onSubmit, loading, error }) {
   const [password, setPassword] = useState('');

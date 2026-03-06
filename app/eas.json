@@ -4,17 +4,32 @@
   },
   "build": {
     "apk": {
+      "env": {
+        "EXPO_PUBLIC_EVA_CORE_URL": "https://eva.tail5afb5a.ts.net",
+        "EXPO_PUBLIC_EVA_WEB_URL": "https://eva.tail5afb5a.ts.net/eva-orchestrator/chat",
+        "EXPO_PUBLIC_EVA_CORE_SOCKET_PATH": "/socket.io"
+      },
       "android": {
         "buildType": "apk",
         "gradleCommand": ":app:assembleRelease"
       }
     },
     "preview": {
+      "env": {
+        "EXPO_PUBLIC_EVA_CORE_URL": "https://eva.tail5afb5a.ts.net",
+        "EXPO_PUBLIC_EVA_WEB_URL": "https://eva.tail5afb5a.ts.net/eva-orchestrator/chat",
+        "EXPO_PUBLIC_EVA_CORE_SOCKET_PATH": "/socket.io"
+      },
       "android": {
         "buildType": "apk"
       }
     },
     "production": {
+      "env": {
+        "EXPO_PUBLIC_EVA_CORE_URL": "https://eva.tail5afb5a.ts.net",
+        "EXPO_PUBLIC_EVA_WEB_URL": "https://eva.tail5afb5a.ts.net/eva-orchestrator/chat",
+        "EXPO_PUBLIC_EVA_CORE_SOCKET_PATH": "/socket.io"
+      },
       "android": {
         "buildType": "app-bundle"
       }
